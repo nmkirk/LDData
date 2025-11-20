@@ -43,5 +43,7 @@ jobs:
       - name: Run tests
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        shell: bash -l {0}
         run: |
-          python -m pytest -q 
+          conda activate lddata
+          python -m pytest -q
