@@ -41,11 +41,14 @@ and link the dataset to your paper page on Hugging Face.
 import argparse
 import os
 import sys
+import time
+import random
 from pathlib import Path
 import httpx
 import fnmatch
 
 from huggingface_hub import HfApi, create_repo  # type: ignore
+from huggingface_hub.errors import HfHubHTTPError  # type: ignore
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,6 +107,77 @@ def get_token(cmd_token: str | None) -> str:
     return token
 
 
+def retry_call(
+    fn,
+    *args,
+    retries: int = 6,
+    base_delay: float = 1.0,
+    max_delay: float = 60.0,
+    allowed_status_for_retry=(429, 500, 502, 503, 504),
+    **kwargs,
+):
+    """
+    Call `fn(*args, **kwargs)` with retries on rate limit (429), server errors and read timeouts.
+    Uses exponential backoff with jitter. If the server provides a Retry-After header it will be honored.
+    """
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except HfHubHTTPError as exc:
+            last_exc = exc
+            # Try to extract status code and headers robustly
+            status_code = getattr(exc, "status_code", None)
+            headers = {}
+            resp = getattr(exc, "response", None)
+            if resp is not None:
+                try:
+                    status_code = getattr(resp, "status_code", status_code)
+                    headers = getattr(resp, "headers", {}) or {}
+                except Exception:
+                    pass
+            if status_code in allowed_status_for_retry:
+                # Honor Retry-After if present
+                retry_after = None
+                for key in ("retry-after", "Retry-After"):
+                    if key in headers:
+                        retry_after = headers.get(key)
+                        break
+                if retry_after is not None:
+                    try:
+                        delay = int(retry_after)
+                    except Exception:
+                        try:
+                            delay = float(retry_after)
+                        except Exception:
+                            delay = None
+                else:
+                    delay = min(max_delay, base_delay * (2 ** attempt))
+                    delay += random.uniform(0, base_delay)
+                # On last attempt, break and raise
+                if attempt == retries - 1:
+                    break
+                time.sleep(delay)
+                continue
+            # Non-retryable HTTP error
+            raise
+        except httpx.ReadTimeout as exc:
+            last_exc = exc
+            if attempt == retries - 1:
+                break
+            delay = min(max_delay, base_delay * (2 ** attempt)) + random.uniform(0, base_delay)
+            time.sleep(delay)
+            continue
+        except Exception as exc:
+            # For other exceptions, do not retry except maybe transient httpx.NetworkError -- keep simple and re-raise
+            last_exc = exc
+            raise
+    # If we exit loop without returning, raise last exception
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("retry_call failed without exception")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -135,7 +209,8 @@ def main() -> None:
 
     # 1. Create (or reuse) the dataset repo on the Hub
     print(f"Creating (or reusing) dataset repo '{repo_id}' on the Hub...")
-    create_repo(
+    retry_call(
+        create_repo,
         repo_id=repo_id,
         repo_type="dataset",
         private=args.private,
@@ -210,7 +285,8 @@ def main() -> None:
         if total_size > LARGE_THRESHOLD and hasattr(api, "upload_large_folder"):
             # Prefer API method designed for large folders when available.
             try:
-                api.upload_large_folder(
+                retry_call(
+                    getattr(api, "upload_large_folder"),
                     folder_path=str(local_path),
                     repo_id=repo_id,
                     repo_type="dataset",
@@ -218,21 +294,23 @@ def main() -> None:
                     token=token,
                 )
             except TypeError:
-                try:
-                    api.upload_large_folder(
-                        folder_path=str(local_path),
-                        repo_id=repo_id,
-                        repo_type="dataset",
-                        token=token,
-                    )
-                except Exception as exc:
-                    print()
-                    print("ERROR: upload_large_folder failed:")
-                    print(f"  {exc!r}")
-                    print("Falling back to per-file upload...")
-                    raise
+                # Signature mismatch: try without ignore_patterns
+                retry_call(
+                    getattr(api, "upload_large_folder"),
+                    folder_path=str(local_path),
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    token=token,
+                )
+            except Exception as exc:
+                print()
+                print("ERROR: upload_large_folder failed:")
+                print(f"  {exc!r}")
+                print("Falling back to per-file upload...")
+                # fall through to per-file upload
         else:
-            api.upload_folder(
+            retry_call(
+                getattr(api, "upload_folder"),
                 folder_path=str(local_path),
                 repo_id=repo_id,
                 repo_type="dataset",
@@ -253,6 +331,12 @@ def main() -> None:
         print("ERROR: Upload function raised a TypeError (likely a signature mismatch):")
         print(f"  {exc!r}")
         print("Falling back to per-file upload...")
+    except HfHubHTTPError as exc:
+        print()
+        print("ERROR: HF Hub returned an HTTP error while attempting to upload:")
+        print(f"  {exc!r}")
+        print("If this is a rate limit (429) you may need to wait, reduce request rate, or upgrade your plan.")
+        sys.exit(1)
     except Exception:
         # If upload_large_folder/upload_folder raised but we want to fallback to per-file, continue below.
         pass
@@ -260,12 +344,13 @@ def main() -> None:
     # Per-file upload fallback: ensure we use the normalized relative paths so subfolders are preserved.
     if files_to_upload:
         print("Falling back to per-file upload (this is slower but more robust for flaky networks)...")
-        for file_path, rel in files_to_upload:
+        for idx, (file_path, rel) in enumerate(files_to_upload):
             # Ensure rel is relative and posix-normalized (it already is from above)
             path_in_repo = rel.lstrip("/")  # safety
             success = False
             try:
-                api.upload_file(
+                retry_call(
+                    getattr(api, "upload_file"),
                     path_or_fileobj=str(file_path),
                     path_in_repo=path_in_repo,
                     repo_id=repo_id,
@@ -278,10 +363,17 @@ def main() -> None:
                 print("ERROR: Per-file upload read timed out on:", path_in_repo)
                 print("You can retry this script or use `hf upload-large-folder` / `HfApi.upload_large_folder`.")
                 sys.exit(1)
+            except HfHubHTTPError as exc:
+                # If we hit 429 here, retry_call would have already retried; if it still fails, surface a helpful message.
+                print()
+                print("ERROR: Failed to upload file due to HF Hub HTTP error:", path_in_repo)
+                print(f"  {exc!r}")
             except Exception as exc:
                 print(f"WARNING: Failed to upload {path_in_repo!s}: {exc!r}")
             if not success:
                 print(f"Failed to upload: {path_in_repo}")
+            # Small pause between per-file uploads to avoid burst-rate limiting
+            time.sleep(0.1 + random.uniform(0, 0.05))
 
     dataset_url = f"https://huggingface.co/datasets/{repo_id}"
     print()
