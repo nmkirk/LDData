@@ -223,7 +223,7 @@ This dataset incorporates formats and ideas from foundational work in QMC:
 If you use LDData in academic work, please cite:
 
 ```
-@article{sorokin.2025.ld_randomizations_ho_nets_fast_kernel_mats,
+@article{sorokin2025,
   title               = {{QMCPy}: a {P}ython software for randomized low-discrepancy sequences, quasi-{M}onte {C}arlo, and fast kernel methods},
   author              = {Aleksei G. Sorokin},
   year                = {2025},
@@ -233,7 +233,7 @@ If you use LDData in academic work, please cite:
 }
 
 
-@inproceedings{choi.QMC_software,
+@inproceedings{choi2022,
   title               = {Quasi-{M}onte {C}arlo software},
   author              = {Choi, Sou-Cheng T. and Hickernell, Fred J. and Rathinavel, Jagadeeswaran and McCourt, Michael J. and Sorokin, Aleksei G.},
   year                = {2022},

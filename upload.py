@@ -134,8 +134,9 @@ def retry_call(
                 try:
                     status_code = getattr(resp, "status_code", status_code)
                     headers = getattr(resp, "headers", {}) or {}
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Log the exception for debugging purposes but continue execution
+                    print(f"WARNING: An unexpected error occurred: {exc!r}")
             if status_code in allowed_status_for_retry:
                 # Honor Retry-After if present
                 retry_after = None
@@ -178,92 +179,62 @@ def retry_call(
     raise RuntimeError("retry_call failed without exception")
 
 
-def main() -> None:
-    args = parse_args()
+def create_api(token: str) -> HfApi:
+    """Create an authenticated HfApi client."""
+    return HfApi(token=token)
 
-    local_path = Path(args.local_path).expanduser().resolve()
-    if not local_path.exists():
-        raise SystemExit(f"Local path does not exist: {local_path}")
 
-    # Sanity check: are we in LDData?
-    readme = local_path / "README.md"
-    if not readme.exists():
-        print(
-            f"WARNING: {readme} does not exist. "
-            "Are you sure this is the LDData repo root?",
-            file=sys.stderr,
+def delete_remote_repo(api: HfApi, repo_id: str, token: str, yes: bool) -> None:
+    """Delete the remote dataset repo if requested. Non-fatal on errors."""
+    if not yes:
+        resp = input(
+            f"Are you sure you want to DELETE the dataset repo '{repo_id}' on Hugging Face? This is irreversible. Type 'yes' to continue: "
         )
+        if resp.strip().lower() != "yes":
+            print("Aborting: remote reset cancelled by user.")
+            sys.exit(0)
 
-    token = get_token(args.token)
-    repo_id = args.repo_id
+    print(f"Deleting remote dataset repo '{repo_id}' (if it exists) on Hugging Face...")
+    try:
+        retry_call(getattr(api, "delete_repo"), repo_id=repo_id, repo_type="dataset", token=token)
+        print("Remote dataset repo deleted (or did not exist).")
+    except HfHubHTTPError as exc:
+        print()
+        print("WARNING: Failed to delete remote dataset repo:")
+        print(f"  {exc!r}")
+        print("Continuing to (re)create the repository.")
+    except Exception as exc:
+        print()
+        print("WARNING: Unexpected error while attempting to delete remote repo:")
+        print(f"  {exc!r}")
+        print("Continuing to (re)create the repository.")
 
-    print(f"Using repo_id: {repo_id}")
-    print(f"Local path : {local_path}")
-    print(f"Private    : {args.private}")
-    if args.dry_run:
-        print("Dry run enabled: NOT creating or uploading, just showing intent.")
-        return
 
-    # Initialize API client
-    api = HfApi(token=token)
-
-    # 1. Create (or reuse) the dataset repo on the Hub
+def create_or_reuse_repo(repo_id: str, private: bool, token: str) -> None:
+    """Create (or reuse) the dataset repo on the Hub."""
     print(f"Creating (or reusing) dataset repo '{repo_id}' on the Hub...")
-    retry_call(
-        create_repo,
-        repo_id=repo_id,
-        repo_type="dataset",
-        private=args.private,
-        exist_ok=True,
-        token=token,
-    )
+    retry_call(create_repo, repo_id=repo_id, repo_type="dataset", private=private, exist_ok=True, token=token)
 
-    # 2. Upload folder contents
-    #    We ignore some typical non-data files to keep the repo clean.
-    #    Adjust this list if you want to exclude more or fewer things.
-    ignore_patterns = [
-        "sc/*",
-        ".git/*",
-        ".gitignore",
-        ".DS_Store",
-        "__pycache__/*",
-        "*.pyc",
-        "*.pyo",
-        "*~",
-        "*.ipynb_checkpoints*",
-        "raw.githubusercontent.com"
-        # If you do NOT want to upload the demo notebook or env file, keep these:
-        # "LDData Demo.ipynb",
-        # "env.yml",
-    ]
 
-    print("Uploading local folder to the Hub (this may take a while)...")
-
-    # NOTE:
-    # Older/newer versions of huggingface_hub's HfApi.upload_folder do not accept
-    # a `timeout` keyword argument. Passing it raises:
-    #   TypeError: HfApi.upload_folder() got an unexpected keyword argument 'timeout'
-    # To remain compatible, call upload_folder without a `timeout` kwarg and
-    # handle httpx.ReadTimeout explicitly.
-
-    # Build list of candidate files and compute total size (exclude ignored)
+def build_ignore_checker(ignore_patterns):
     def is_ignored(rel_path: str) -> bool:
-        # fnmatch against each ignore pattern; use posix style paths
         for patt in ignore_patterns:
-            if fnmatch.fnmatch(rel_path, patt):
-                return True
-            if fnmatch.fnmatch("/" + rel_path, patt):
+            if fnmatch.fnmatch(rel_path, patt) or fnmatch.fnmatch("/" + rel_path, patt):
                 return True
         return False
 
+    return is_ignored
+
+
+def gather_files(local_path: Path, ignore_patterns):
+    """Return a list of (full_path, rel_posix_path) and total size, skipping ignore patterns."""
+    is_ignored = build_ignore_checker(ignore_patterns)
     files_to_upload = []
     total_size = 0
     for root, _, files in os.walk(local_path):
         for fname in files:
             full = Path(root) / fname
-            # Robust relative path computation: use os.path.relpath to avoid Path.relative_to errors
             rel = os.path.relpath(str(full), start=str(local_path))
-            # Normalize to posix separators and strip any leading './' or '/'
             rel = rel.replace(os.sep, "/")
             if rel.startswith("./"):
                 rel = rel[2:]
@@ -277,45 +248,31 @@ def main() -> None:
                 sz = 0
             files_to_upload.append((full, rel))
             total_size += sz
+    return files_to_upload, total_size
 
-    # Threshold to prefer upload_large_folder (50 MiB)
+
+def perform_bulk_upload(api: HfApi, local_path: Path, repo_id: str, ignore_patterns, token: str) -> bool:
+    """Attempt bulk upload via upload_large_folder or upload_folder. Returns True on success."""
     LARGE_THRESHOLD = 50 * 1024 * 1024
-
+    # prefer upload_large_folder if folder is large and API provides it
+    files_to_upload, total_size = gather_files(local_path, ignore_patterns)
     try:
         if total_size > LARGE_THRESHOLD and hasattr(api, "upload_large_folder"):
-            # Prefer API method designed for large folders when available.
             try:
-                retry_call(
-                    getattr(api, "upload_large_folder"),
-                    folder_path=str(local_path),
-                    repo_id=repo_id,
-                    repo_type="dataset",
-                    ignore_patterns=ignore_patterns,
-                    token=token,
-                )
+                retry_call(getattr(api, "upload_large_folder"), folder_path=str(local_path), repo_id=repo_id, repo_type="dataset", ignore_patterns=ignore_patterns, token=token)
+                return True
             except TypeError:
-                # Signature mismatch: try without ignore_patterns
-                retry_call(
-                    getattr(api, "upload_large_folder"),
-                    folder_path=str(local_path),
-                    repo_id=repo_id,
-                    repo_type="dataset",
-                    token=token,
-                )
+                retry_call(getattr(api, "upload_large_folder"), folder_path=str(local_path), repo_id=repo_id, repo_type="dataset", token=token)
+                return True
             except Exception as exc:
                 print()
                 print("ERROR: upload_large_folder failed:")
                 print(f"  {exc!r}")
                 print("Falling back to per-file upload...")
-                # fall through to per-file upload
+                return False
         else:
-            retry_call(
-                getattr(api, "upload_folder"),
-                folder_path=str(local_path),
-                repo_id=repo_id,
-                repo_type="dataset",
-                ignore_patterns=ignore_patterns,
-            )
+            retry_call(getattr(api, "upload_folder"), folder_path=str(local_path), repo_id=repo_id, repo_type="dataset", ignore_patterns=ignore_patterns)
+            return True
     except httpx.ReadTimeout:
         print()
         print("ERROR: Upload read timed out.")
@@ -331,6 +288,7 @@ def main() -> None:
         print("ERROR: Upload function raised a TypeError (likely a signature mismatch):")
         print(f"  {exc!r}")
         print("Falling back to per-file upload...")
+        return False
     except HfHubHTTPError as exc:
         print()
         print("ERROR: HF Hub returned an HTTP error while attempting to upload:")
@@ -338,42 +296,87 @@ def main() -> None:
         print("If this is a rate limit (429) you may need to wait, reduce request rate, or upgrade your plan.")
         sys.exit(1)
     except Exception:
-        # If upload_large_folder/upload_folder raised but we want to fallback to per-file, continue below.
-        pass
+        return False
 
-    # Per-file upload fallback: ensure we use the normalized relative paths so subfolders are preserved.
-    if files_to_upload:
-        print("Falling back to per-file upload (this is slower but more robust for flaky networks)...")
-        for idx, (file_path, rel) in enumerate(files_to_upload):
-            # Ensure rel is relative and posix-normalized (it already is from above)
-            path_in_repo = rel.lstrip("/")  # safety
-            success = False
-            try:
-                retry_call(
-                    getattr(api, "upload_file"),
-                    path_or_fileobj=str(file_path),
-                    path_in_repo=path_in_repo,
-                    repo_id=repo_id,
-                    repo_type="dataset",
-                    token=token,
-                )
-                success = True
-            except httpx.ReadTimeout:
-                print()
-                print("ERROR: Per-file upload read timed out on:", path_in_repo)
-                print("You can retry this script or use `hf upload-large-folder` / `HfApi.upload_large_folder`.")
-                sys.exit(1)
-            except HfHubHTTPError as exc:
-                # If we hit 429 here, retry_call would have already retried; if it still fails, surface a helpful message.
-                print()
-                print("ERROR: Failed to upload file due to HF Hub HTTP error:", path_in_repo)
-                print(f"  {exc!r}")
-            except Exception as exc:
-                print(f"WARNING: Failed to upload {path_in_repo!s}: {exc!r}")
-            if not success:
-                print(f"Failed to upload: {path_in_repo}")
-            # Small pause between per-file uploads to avoid burst-rate limiting
-            time.sleep(0.1 + random.uniform(0, 0.05))
+
+def perform_per_file_upload(api: HfApi, files_to_upload, repo_id: str, token: str) -> None:
+    """Upload files one-by-one as a fallback."""
+    if not files_to_upload:
+        return
+    print("Falling back to per-file upload (this is slower but more robust for flaky networks)...")
+    for idx, (file_path, rel) in enumerate(files_to_upload):
+        path_in_repo = rel.lstrip("/")
+        success = False
+        try:
+            retry_call(getattr(api, "upload_file"), path_or_fileobj=str(file_path), path_in_repo=path_in_repo, repo_id=repo_id, repo_type="dataset", token=token)
+            success = True
+        except httpx.ReadTimeout:
+            print()
+            print("ERROR: Per-file upload read timed out on:", path_in_repo)
+            print("You can retry this script or use `hf upload-large-folder` / `HfApi.upload_large_folder`.")
+            sys.exit(1)
+        except HfHubHTTPError as exc:
+            print()
+            print("ERROR: Failed to upload file due to HF Hub HTTP error:", path_in_repo)
+            print(f"  {exc!r}")
+        except Exception as exc:
+            print(f"WARNING: Failed to upload {path_in_repo!s}: {exc!r}")
+        if not success:
+            print(f"Failed to upload: {path_in_repo}")
+        time.sleep(0.1 + random.uniform(0, 0.05))
+
+
+def main() -> None:
+    args = parse_args()
+
+    local_path = Path(args.local_path).expanduser().resolve()
+    if not local_path.exists():
+        raise SystemExit(f"Local path does not exist: {local_path}")
+
+    readme = local_path / "README.md"
+    if not readme.exists():
+        print(f"WARNING: {readme} does not exist. Are you sure this is the LDData repo root?", file=sys.stderr)
+
+    token = get_token(args.token)
+    repo_id = args.repo_id
+
+    print(f"Using repo_id: {repo_id}")
+    print(f"Local path : {local_path}")
+    print(f"Private    : {args.private}")
+    if args.dry_run:
+        print("Dry run enabled: NOT creating or uploading, just showing intent.")
+        return
+
+    api = create_api(token)
+
+    if args.reset_remote:
+        delete_remote_repo(api, repo_id, token, args.yes)
+
+    create_or_reuse_repo(repo_id, args.private, token)
+
+    ignore_patterns = [
+        "sc/*",
+        ".git/*",
+        ".gitignore",
+        ".DS_Store",
+        "__pycache__/*",
+        "*.pyc",
+        "*.pyo",
+        "*~",
+        "*.ipynb_checkpoints*",
+        "raw.githubusercontent.com",
+    ]
+
+    print("Uploading local folder to the Hub (this may take a while)...")
+
+    # gather files in case we need per-file fallback
+    files_to_upload, _ = gather_files(local_path, ignore_patterns)
+
+    bulk_ok = perform_bulk_upload(api, local_path, repo_id, ignore_patterns, token)
+    if bulk_ok:
+        print("Bulk upload succeeded — skipping per-file fallback.")
+    else:
+        perform_per_file_upload(api, files_to_upload, repo_id, token)
 
     dataset_url = f"https://huggingface.co/datasets/{repo_id}"
     print()

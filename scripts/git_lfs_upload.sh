@@ -108,12 +108,32 @@ if ! command -v git-lfs >/dev/null 2>&1; then
   fi
 fi
 
-# Prepare clone URL
+# Prepare clone URL (do NOT embed token in the URL)
+CLONE_URL="https://huggingface.co/datasets/${REPO_ID}.git"
+
+# If HF_TOKEN is provided, use a temporary GIT_ASKPASS helper so the token
+# is not exposed on the command line or process list. The helper prints the
+# token when git prompts for a password. We keep the helper for the duration
 if [[ -n "$HF_TOKEN" ]]; then
-  # Embed token for non-interactive auth (note: exposing token in process list may be a security risk)
-  CLONE_URL="https://${HF_TOKEN}@huggingface.co/datasets/${REPO_ID}.git"
-else
-  CLONE_URL="https://huggingface.co/datasets/${REPO_ID}.git"
+  ASKPASS_SCRIPT=$(mktemp -t hf_askpass.XXXXXX)
+  # Write an askpass helper that prints the token from the environment.
+  # Use a quoted heredoc so $HF_TOKEN is not expanded into the file.
+  cat > "$ASKPASS_SCRIPT" <<'ASKPASS_EOF'
+#!/usr/bin/env sh
+# GIT_ASKPASS helper: print HF_TOKEN from the environment (do not echo a newline)
+printf "%s" "$HF_TOKEN"
+ASKPASS_EOF
+  chmod 700 "$ASKPASS_SCRIPT"
+  export GIT_ASKPASS="$ASKPASS_SCRIPT"
+  # Prevent git from falling back to terminal prompting
+  export GIT_TERMINAL_PROMPT=0
+
+  cleanup_askpass() {
+    unset GIT_ASKPASS
+    unset GIT_TERMINAL_PROMPT
+    rm -f "$ASKPASS_SCRIPT" || true
+  }
+  trap cleanup_askpass EXIT
 fi
 
 # Clone the repo

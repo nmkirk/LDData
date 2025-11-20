@@ -24,16 +24,24 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          lfs: true
+
+      - name: Ensure Git LFS
+        run: |
+          git lfs install --local || true
       
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Setup conda environment from env.yml
+        uses: conda-incubator/setup-miniconda@v3
         with:
-          python-version: '3.11'
-      
-      - name: Install dependencies
+          environment-file: env.yml
+          activate-environment: lddata
+          auto-update-conda: true
+
+      - name: Install package into the conda env
+        shell: bash -l {0}
         run: |
           python -m pip install --upgrade pip
-          pip install "huggingface_hub>=0.32.0" httpx
+          python -m pip install -e .
       
       - name: Upload to HuggingFace
         env:
@@ -41,8 +49,7 @@ jobs:
         run: |
           python upload.py \
             --repo-id QMCSoftware/LDData \
-            --local-path . \
-            --yes
+            --local-path .
       
       - name: Report status
         if: success()
