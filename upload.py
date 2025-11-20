@@ -43,6 +43,7 @@ import os
 import sys
 from pathlib import Path
 import httpx
+import fnmatch
 
 from huggingface_hub import HfApi, create_repo  # type: ignore
 
@@ -78,6 +79,16 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="Do not upload, just print what would be done.",
+    )
+    parser.add_argument(
+        "--reset-remote",
+        action="store_true",
+        help="Delete the remote dataset repo on the Hub before uploading (destructive).",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Answer yes to any interactive confirmation prompts (use with care).",
     )
     return parser.parse_args()
 
@@ -136,6 +147,7 @@ def main() -> None:
     #    We ignore some typical non-data files to keep the repo clean.
     #    Adjust this list if you want to exclude more or fewer things.
     ignore_patterns = [
+        "sc/*",
         ".git/*",
         ".gitignore",
         ".DS_Store",
@@ -144,7 +156,6 @@ def main() -> None:
         "*.pyo",
         "*~",
         "*.ipynb_checkpoints*",
-        "sc",
         "raw.githubusercontent.com"
         # If you do NOT want to upload the demo notebook or env file, keep these:
         # "LDData Demo.ipynb",
@@ -159,27 +170,118 @@ def main() -> None:
     #   TypeError: HfApi.upload_folder() got an unexpected keyword argument 'timeout'
     # To remain compatible, call upload_folder without a `timeout` kwarg and
     # handle httpx.ReadTimeout explicitly.
+
+    # Build list of candidate files and compute total size (exclude ignored)
+    def is_ignored(rel_path: str) -> bool:
+        # fnmatch against each ignore pattern; use posix style paths
+        for patt in ignore_patterns:
+            if fnmatch.fnmatch(rel_path, patt):
+                return True
+            if fnmatch.fnmatch("/" + rel_path, patt):
+                return True
+        return False
+
+    files_to_upload = []
+    total_size = 0
+    for root, _, files in os.walk(local_path):
+        for fname in files:
+            full = Path(root) / fname
+            # Robust relative path computation: use os.path.relpath to avoid Path.relative_to errors
+            rel = os.path.relpath(str(full), start=str(local_path))
+            # Normalize to posix separators and strip any leading './' or '/'
+            rel = rel.replace(os.sep, "/")
+            if rel.startswith("./"):
+                rel = rel[2:]
+            if rel.startswith("/"):
+                rel = rel.lstrip("/")
+            if is_ignored(rel):
+                continue
+            try:
+                sz = full.stat().st_size
+            except OSError:
+                sz = 0
+            files_to_upload.append((full, rel))
+            total_size += sz
+
+    # Threshold to prefer upload_large_folder (50 MiB)
+    LARGE_THRESHOLD = 50 * 1024 * 1024
+
     try:
-        api.upload_folder(
-            folder_path=str(local_path),
-            repo_id=repo_id,
-            repo_type="dataset",
-            ignore_patterns=ignore_patterns,
-        )
+        if total_size > LARGE_THRESHOLD and hasattr(api, "upload_large_folder"):
+            # Prefer API method designed for large folders when available.
+            try:
+                api.upload_large_folder(
+                    folder_path=str(local_path),
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    ignore_patterns=ignore_patterns,
+                    token=token,
+                )
+            except TypeError:
+                try:
+                    api.upload_large_folder(
+                        folder_path=str(local_path),
+                        repo_id=repo_id,
+                        repo_type="dataset",
+                        token=token,
+                    )
+                except Exception as exc:
+                    print()
+                    print("ERROR: upload_large_folder failed:")
+                    print(f"  {exc!r}")
+                    print("Falling back to per-file upload...")
+                    raise
+        else:
+            api.upload_folder(
+                folder_path=str(local_path),
+                repo_id=repo_id,
+                repo_type="dataset",
+                ignore_patterns=ignore_patterns,
+            )
     except httpx.ReadTimeout:
         print()
         print("ERROR: Upload read timed out.")
         print("Possible actions:")
         print("  - Check your network connection and try again.")
         print("  - Try uploading in smaller batches (split large files or directories).")
+        print("  - Use `HfApi().upload_large_folder(...)` or the CLI `hf upload-large-folder` if available.")
         print("  - Upgrade huggingface_hub to the latest version in case it adds improved timeout handling.")
         print("  - If you have very large files, consider using git-lfs or the web UI.")
         sys.exit(1)
-    except Exception as exc:
+    except TypeError as exc:
         print()
-        print("ERROR: Upload failed with an unexpected error:")
+        print("ERROR: Upload function raised a TypeError (likely a signature mismatch):")
         print(f"  {exc!r}")
-        sys.exit(1)
+        print("Falling back to per-file upload...")
+    except Exception:
+        # If upload_large_folder/upload_folder raised but we want to fallback to per-file, continue below.
+        pass
+
+    # Per-file upload fallback: ensure we use the normalized relative paths so subfolders are preserved.
+    if files_to_upload:
+        print("Falling back to per-file upload (this is slower but more robust for flaky networks)...")
+        for file_path, rel in files_to_upload:
+            # Ensure rel is relative and posix-normalized (it already is from above)
+            path_in_repo = rel.lstrip("/")  # safety
+            success = False
+            try:
+                api.upload_file(
+                    path_or_fileobj=str(file_path),
+                    path_in_repo=path_in_repo,
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    token=token,
+                )
+                success = True
+            except httpx.ReadTimeout:
+                print()
+                print("ERROR: Per-file upload read timed out on:", path_in_repo)
+                print("You can retry this script or use `hf upload-large-folder` / `HfApi.upload_large_folder`.")
+                sys.exit(1)
+            except Exception as exc:
+                print(f"WARNING: Failed to upload {path_in_repo!s}: {exc!r}")
+            if not success:
+                print(f"Failed to upload: {path_in_repo}")
 
     dataset_url = f"https://huggingface.co/datasets/{repo_id}"
     print()

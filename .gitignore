@@ -4,3 +4,4 @@ raw.githubusercontent.com/*
 *.ipynb-checkpoints
 /sc
 .vscode/settings.json
+*.pyc
