@@ -242,7 +242,7 @@ For a `shiftmod1` in $s$ dimensions, the file will contain $s$ in the first line
 3   # s = 3 dimensions
 0.32638741823951621
 0.91325392536931693
-0.1530364040t106301
+0.15303640401106301
 ```
 
 For a `dshift` with $r$ digits of accuracy in base $b$, in $s$ dimensions, the file will contain $b$ in the first line, $s$ in the second line, $r$ in the third line, and then $s$ integers from 0 to $b^r-1$, one per line. For the latter, the digits of the base $b$ representation of the integer divided by $b^r$ will be added modulo $b$ to the corresponding digits of the base $b$ representation of the coordinate.  For example, if $b=2$ and $r=31$, the randomization makes a xor of the 31 bits of this integer with the 31 most significant bits of the corresponding coordinate of each point.
