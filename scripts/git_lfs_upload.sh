@@ -114,6 +114,7 @@ CLONE_URL="https://huggingface.co/datasets/${REPO_ID}.git"
 # If HF_TOKEN is provided, use a temporary GIT_ASKPASS helper so the token
 # is not exposed on the command line or process list. The helper prints the
 # token when git prompts for a password. We keep the helper for the duration
+# of the script (so pushes work) and remove it on exit.
 if [[ -n "$HF_TOKEN" ]]; then
   ASKPASS_SCRIPT=$(mktemp -t hf_askpass.XXXXXX)
   # Write an askpass helper that prints the token from the environment.
